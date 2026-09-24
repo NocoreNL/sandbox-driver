@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    AuthError, Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputStream, ProviderError, ProviderKind, Result, Termination,
+    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputStream,
+    Result, Termination,
 };
 
-use crate::client::{AcaApiError, AcaClient};
+use crate::client::{AcaClient, aca_error};
 
 /// Command execution against one ACA sandbox.
 ///
@@ -70,7 +70,7 @@ impl Exec for AcaExec {
             .client
             .exec(&self.sandbox_id, &cmd)
             .await
-            .map_err(|error| aca_error("exec", error))?;
+            .map_err(aca_error)?;
 
         let mut result = ExecResult::new(
             Termination::Exited,
@@ -147,21 +147,11 @@ fn build_command(
 
 /// Single-quote a shell word, escaping embedded single quotes as `'\''`
 /// (close the quote, an escaped literal `'`, reopen the quote).
-fn shq(s: &str) -> String {
+///
+/// `pub(crate)` so `fs.rs`'s exec-derived operations (`create_dir`/
+/// `delete`/`rename`) share this instead of a duplicate escaper.
+pub(crate) fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// Map an [`AcaApiError`] to the crate's [`Error`]. `Auth` becomes
-/// [`Error::Auth`] (a caller-preflightable class); everything else folds
-/// into [`Error::Provider`], keeping the classified `AcaApiError` as the
-/// source so its `Display` (which already distinguishes not-found/
-/// not-running/other) stays reachable through the error chain.
-fn aca_error(context: &'static str, error: AcaApiError) -> Error {
-    let kind = ProviderKind::try_new("aca").expect("static provider kind is valid");
-    match error {
-        auth @ AcaApiError::Auth => Error::Auth(AuthError::with_source(kind, context, auth)),
-        other => Error::Provider(ProviderError::with_source(kind, context, other)),
-    }
 }
 
 #[cfg(test)]

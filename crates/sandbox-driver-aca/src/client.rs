@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use reqwest::{Method, StatusCode};
+use sandbox_driver::{AuthError, Error, ProviderError, ProviderKind};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::TokenSource;
@@ -378,6 +379,28 @@ fn extract_problem_message(body: &str) -> Option<String> {
     }
 }
 
+/// Map an [`AcaApiError`] to the crate's [`Error`]. `Auth` becomes
+/// [`Error::Auth`] (a caller-preflightable class); everything else folds
+/// into [`Error::Provider`], keeping the classified `AcaApiError` as the
+/// source so its `Display` (which already distinguishes not-found/
+/// not-running/other) stays reachable through the error chain. The
+/// `AcaApiError`'s own `Display` text — already operation-specific, e.g.
+/// "ACA sandbox not found" — becomes the reason/message, rather than a
+/// caller-supplied static label, so every call site (exec, fs) maps the
+/// same way without having to invent its own context string.
+///
+/// Shared by [`crate::exec`] and [`crate::fs`] — the two call sites that
+/// turn a raw [`AcaApiError`] into the crate's [`Error`].
+#[must_use]
+pub fn aca_error(error: AcaApiError) -> Error {
+    let kind = ProviderKind::try_new("aca").expect("static provider kind is valid");
+    let reason = error.to_string();
+    match error {
+        auth @ AcaApiError::Auth => Error::Auth(AuthError::with_source(kind, reason, auth)),
+        other => Error::Provider(ProviderError::with_source(kind, reason, other)),
+    }
+}
+
 // --- client -------------------------------------------------------------
 
 /// Typed REST client over the ACA sandbox data plane.
@@ -698,6 +721,22 @@ mod tests {
             "https://management.northeurope.azuredevcompute.io/subscriptions/sub/resourceGroups/rg/sandboxGroups/sg/sandboxes"
         );
         assert_eq!(scope.api_version(), "2026-02-01-preview");
+    }
+
+    #[test]
+    fn aca_error_maps_auth_to_error_auth_and_others_to_error_provider() {
+        assert!(matches!(aca_error(AcaApiError::Auth), Error::Auth(_)));
+        assert!(matches!(
+            aca_error(AcaApiError::NotFound),
+            Error::Provider(_)
+        ));
+        assert!(matches!(
+            aca_error(AcaApiError::Other {
+                status: 500,
+                message: "boom".into(),
+            }),
+            Error::Provider(_)
+        ));
     }
 
     #[test]
