@@ -54,20 +54,20 @@ mod tests {
         assert!(!caps.search.supported);
         assert!(!caps.services.supported);
 
-        assert!(!caps.exec.stdin);
-        assert!(!caps.exec.stop);
-        assert!(!caps.exec.live_streaming);
-        assert!(!caps.exec.stdio_process);
-        assert!(!caps.exec.stdin_stream);
-        assert!(!caps.exec.environment);
-        assert!(!caps.fs.upload);
-        assert!(!caps.fs.download);
-        assert!(!caps.fs.permissions);
-        assert!(!caps.network.allow_all);
-        assert!(!caps.network.block_all);
-        assert!(!caps.network.cidr_allow_list);
-        assert!(caps.pty.is_none());
-        assert!(caps.snapshots.is_none());
-        assert!(caps.volumes.is_none());
+        // Structural check covering every remaining field at once —
+        // `Capabilities::minimal` with exactly the three flags above
+        // flipped — so a future accidental flip anywhere else
+        // (lifecycle.*, access.*, logs, network.outbound_proxy, exec.*,
+        // fs.*, ...) fails this test instead of silently over-claiming a
+        // capability the provider doesn't implement. Compared via JSON
+        // since `Capabilities` has no `PartialEq`.
+        let mut expected = Capabilities::minimal(Isolation::Container);
+        expected.exec.streams_separated = true;
+        expected.fs.native = true;
+        expected.network.domain_allow_list = true;
+        assert_eq!(
+            serde_json::to_value(&caps).expect("capabilities serialize"),
+            serde_json::to_value(&expected).expect("capabilities serialize"),
+        );
     }
 }

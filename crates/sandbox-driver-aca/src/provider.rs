@@ -22,7 +22,8 @@ use tokio::time::{Instant, sleep};
 use crate::auth::EntraTokenSource;
 use crate::client::{AcaClient, AcaScope, aca_error};
 use crate::create::{
-    self, AcaDefaults, DEFAULT_AUTO_SUSPEND_SECS, DEFAULT_CPU, DEFAULT_DISK_IMAGE, DEFAULT_MEMORY,
+    self, AcaAppPlan, AcaDefaults, DEFAULT_AUTO_SUSPEND_SECS, DEFAULT_CPU, DEFAULT_DISK_IMAGE,
+    DEFAULT_MEMORY,
 };
 use crate::inspect;
 use crate::sandbox::AcaSandbox;
@@ -168,9 +169,14 @@ impl AcaProvider {
     }
 
     /// Polls `id` until it reaches [`SandboxState::Running`] or
-    /// [`CREATE_TIMEOUT`] elapses. On timeout, best-effort deletes the
-    /// half-created (and billed) sandbox before returning the error, so a
-    /// failed create never leaks a sandbox silently.
+    /// [`CREATE_TIMEOUT`] elapses.
+    ///
+    /// Propagates every failure mode as-is — a transient API error during
+    /// polling, and a timeout — without attempting cleanup itself.
+    /// [`Self::create`] is the single place that decides what to do with a
+    /// sandbox left behind by a failed create, covering *every* error this
+    /// (and every other step after `create_sandbox`) can return, not just
+    /// the timeout.
     async fn wait_for_running(&self, id: &str) -> Result<()> {
         let deadline = Instant::now() + CREATE_TIMEOUT;
         loop {
@@ -182,7 +188,6 @@ impl AcaProvider {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let _ = self.client.delete_sandbox(id).await;
                 return Err(Error::Provider(ProviderError::new(
                     self.kind.clone(),
                     format!("sandbox did not reach Running within {CREATE_TIMEOUT:?}"),
@@ -190,6 +195,35 @@ impl AcaProvider {
             }
             sleep(CREATE_POLL_INTERVAL).await;
         }
+    }
+
+    /// Everything after the sandbox exists: wait for it to reach `Running`,
+    /// set its egress policy, and build the handle.
+    ///
+    /// A failure anywhere in here leaves a billed ACA sandbox behind, so
+    /// [`Self::create`] wraps this one call in best-effort cleanup that
+    /// covers every failure mode uniformly, mirroring
+    /// `sandbox-driver-daytona`'s `create_inner`/`cleanup_failed_create`
+    /// split.
+    async fn finish_create(&self, id: &str, plan: AcaAppPlan) -> Result<Arc<dyn Sandbox>> {
+        self.wait_for_running(id).await?;
+
+        self.client
+            .set_egress(id, &plan.egress)
+            .await
+            .map_err(aca_error)?;
+
+        let sandbox_id =
+            SandboxId::try_new(id).map_err(|error| Error::invalid_spec("id", error.to_string()))?;
+        let sandbox = AcaSandbox::new(
+            sandbox_id,
+            plan.working_dir,
+            self.caps.clone(),
+            self.client.clone(),
+            plan.labels,
+            plan.env,
+        );
+        Ok(Arc::new(sandbox))
     }
 }
 
@@ -213,24 +247,19 @@ impl SandboxProvider for AcaProvider {
         let created = self.client.create_sandbox(body).await.map_err(aca_error)?;
         let id = created.id;
 
-        self.wait_for_running(&id).await?;
-
-        self.client
-            .set_egress(&id, &plan.egress)
-            .await
-            .map_err(aca_error)?;
-
-        let sandbox_id =
-            SandboxId::try_new(id).map_err(|error| Error::invalid_spec("id", error.to_string()))?;
-        let sandbox = AcaSandbox::new(
-            sandbox_id,
-            plan.working_dir,
-            self.caps.clone(),
-            self.client.clone(),
-            plan.labels,
-            plan.env,
-        );
-        Ok(Arc::new(sandbox))
+        // Everything from here on works against a sandbox that already
+        // exists (and is already billed): any failure — a transient error
+        // while polling for Running, the timeout, or a failed
+        // `set_egress` on an already-Running sandbox — must best-effort
+        // delete it before propagating the original error, or the
+        // sandbox leaks forever.
+        match self.finish_create(&id, plan).await {
+            Ok(sandbox) => Ok(sandbox),
+            Err(error) => {
+                let _ = self.client.delete_sandbox(&id).await;
+                Err(error)
+            }
+        }
     }
 
     async fn attach(
