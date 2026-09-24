@@ -1950,6 +1950,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-driver-aca"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "reqwest",
+ "sandbox-driver",
+ "sandbox-driver-aca-config",
+ "sandbox-driver-conformance",
+ "sandbox-driver-protocol",
+ "sandbox-driver-testing",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-driver-aca-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sandbox-driver-cli"
 version = "0.1.0"
 dependencies = [
