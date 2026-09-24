@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Error, EventContext, HealthStatus, ProviderError, ProviderHealth, ProviderKind,
-    ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
-    SandboxState, SandboxStatus,
+    Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, HealthStatus,
+    ProviderError, ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, SandboxStatus,
 };
 use tokio::time::{Instant, sleep};
 
@@ -240,58 +240,92 @@ impl SandboxProvider for AcaProvider {
     async fn create(
         &self,
         spec: &SandboxSpec,
-        _events: Option<EventContext>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let plan = create::plan(spec, &self.defaults)?;
-        let body = create::create_body(&plan);
-        let created = self.client.create_sandbox(body).await.map_err(aca_error)?;
-        let id = created.id;
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        emitter
+            .run(
+                EventSubject::pending_sandbox(spec.name.clone()),
+                Action::Create,
+                |reporter| async move {
+                    let plan = create::plan(spec, &self.defaults)?;
+                    let body = create::create_body(&plan);
+                    let created = self.client.create_sandbox(body).await.map_err(aca_error)?;
+                    let id = created.id;
 
-        // Everything from here on works against a sandbox that already
-        // exists (and is already billed): any failure — a transient error
-        // while polling for Running, the timeout, or a failed
-        // `set_egress` on an already-Running sandbox — must best-effort
-        // delete it before propagating the original error, or the
-        // sandbox leaks forever.
-        match self.finish_create(&id, plan).await {
-            Ok(sandbox) => Ok(sandbox),
-            Err(error) => {
-                let _ = self.client.delete_sandbox(&id).await;
-                Err(error)
-            }
-        }
+                    // The terminal event must identify the sandbox ACA just
+                    // created; an id ACA hands back that this crate cannot
+                    // represent is itself a create failure, so it takes the
+                    // same best-effort cleanup as every later step.
+                    match SandboxId::try_new(&id) {
+                        Ok(event_id) => {
+                            reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                        }
+                        Err(error) => {
+                            let _ = self.client.delete_sandbox(&id).await;
+                            return Err(Error::invalid_spec("id", error.to_string()));
+                        }
+                    }
+
+                    // Everything from here on works against a sandbox that
+                    // already exists (and is already billed): any failure —
+                    // a transient error while polling for Running, the
+                    // timeout, or a failed `set_egress` on an
+                    // already-Running sandbox — must best-effort delete it
+                    // before propagating the original error, or the
+                    // sandbox leaks forever.
+                    match self.finish_create(&id, plan).await {
+                        Ok(sandbox) => Ok(sandbox),
+                        Err(error) => {
+                            let _ = self.client.delete_sandbox(&id).await;
+                            Err(error)
+                        }
+                    }
+                },
+            )
+            .await
     }
 
     async fn attach(
         &self,
         id: &SandboxId,
-        _events: Option<EventContext>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let resource = self
-            .client
-            .get_sandbox(id.as_str())
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Attach,
+                |_reporter| async move {
+                    let resource = self
+                        .client
+                        .get_sandbox(id.as_str())
+                        .await
+                        .map_err(aca_error)?;
+                    if resource.is_none() {
+                        return Err(Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id: id.as_str().to_owned(),
+                        });
+                    }
+                    // ACA reports no labels of its own (see
+                    // `SandboxResource`'s doc comment) and `attach` has no
+                    // `SandboxSpec` to read a caller-requested working
+                    // directory or env from, so both start empty/default
+                    // here — a documented limitation of attaching without
+                    // the original create-time spec.
+                    let sandbox = AcaSandbox::new(
+                        id.clone(),
+                        ATTACH_WORKING_DIRECTORY.to_owned(),
+                        self.caps.clone(),
+                        self.client.clone(),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                    );
+                    Ok(Arc::new(sandbox) as Arc<dyn Sandbox>)
+                },
+            )
             .await
-            .map_err(aca_error)?;
-        if resource.is_none() {
-            return Err(Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id: id.as_str().to_owned(),
-            });
-        }
-        // ACA reports no labels of its own (see `SandboxResource`'s doc
-        // comment) and `attach` has no `SandboxSpec` to read a
-        // caller-requested working directory or env from, so both start
-        // empty/default here — a documented limitation of attaching
-        // without the original create-time spec.
-        let sandbox = AcaSandbox::new(
-            id.clone(),
-            ATTACH_WORKING_DIRECTORY.to_owned(),
-            self.caps.clone(),
-            self.client.clone(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        Ok(Arc::new(sandbox))
     }
 
     async fn list(&self, _filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
@@ -302,14 +336,23 @@ impl SandboxProvider for AcaProvider {
         resources.iter().map(inspect::status_from_ref).collect()
     }
 
-    async fn delete(&self, id: &SandboxId, _events: Option<EventContext>) -> Result<()> {
-        // `delete_sandbox` already treats a 404 as success, so this is
-        // idempotent as the trait requires without needing the default
-        // attach-then-delete.
-        self.client
-            .delete_sandbox(id.as_str())
+    async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Delete,
+                |_reporter| async move {
+                    // `delete_sandbox` already treats a 404 as success, so
+                    // this is idempotent as the trait requires without
+                    // needing the default attach-then-delete.
+                    self.client
+                        .delete_sandbox(id.as_str())
+                        .await
+                        .map_err(aca_error)
+                },
+            )
             .await
-            .map_err(aca_error)
     }
 
     async fn health(&self) -> Result<ProviderHealth> {

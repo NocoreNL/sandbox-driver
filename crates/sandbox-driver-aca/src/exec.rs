@@ -18,6 +18,7 @@ use sandbox_driver::{
 };
 
 use crate::client::{AcaClient, aca_error};
+use crate::fs::abspath;
 
 /// Command execution against one ACA sandbox.
 ///
@@ -72,7 +73,7 @@ impl Exec for AcaExec {
             .await
             .map_err(aca_error)?;
 
-        let mut result = ExecResult::new(
+        let mut result = ExecResult::from_shell_status(
             Termination::Exited,
             Some(resp.exit_code),
             Duration::from_millis(resp.execution_time_ms),
@@ -117,7 +118,11 @@ fn merged_env(base: &BTreeMap<String, String>, spec: &ExecSpec) -> BTreeMap<Stri
 
 /// Build the single command string ACA's `executeShellCommand` runs.
 ///
-/// Pure — no I/O. `cwd` is `working_dir`, or `workspace` when unset. `env`
+/// Pure — no I/O. `cwd` is `working_dir` resolved against `workspace` (see
+/// [`crate::fs::abspath`] — a relative `working_dir` is joined onto
+/// `workspace` instead of being handed to `cd` as-is, since ACA's shell
+/// would otherwise resolve it against its own ambient cwd rather than the
+/// sandbox's workspace), or `workspace` itself when unset. `env`
 /// assignments (sorted — `env` is a `BTreeMap`) are prepended via
 /// `env K=V...` so they reach the program without a shell `export`. Every
 /// token is single-quoted with [`shq`], preserving `execvp` semantics
@@ -130,10 +135,10 @@ fn build_command(
     workspace: &str,
     env: &BTreeMap<String, String>,
 ) -> String {
-    let cwd = working_dir.unwrap_or(workspace);
+    let cwd = working_dir.map_or_else(|| workspace.to_owned(), |dir| abspath(workspace, dir));
     let mut parts = vec![
         "cd".to_string(),
-        shq(cwd),
+        shq(&cwd),
         "&&".to_string(),
         "env".to_string(),
     ];
@@ -173,6 +178,24 @@ mod tests {
 
         let cmd2 = build_command("ls", &[], Some("/tmp"), "/workspace", &env);
         assert!(cmd2.starts_with("cd '/tmp' && "), "got: {cmd2}");
+    }
+
+    /// A relative `working_dir` must resolve against `workspace`, not
+    /// against ACA's own ambient shell cwd — the conformance check
+    /// `relative_working_dir_resolves` sets `working_dir("cwd-probe")` and
+    /// expects `pwd` to report `<workspace>/cwd-probe`.
+    #[test]
+    fn relative_working_dir_resolves_against_workspace() {
+        let env = BTreeMap::new();
+        let cmd = build_command("pwd", &[], Some("cwd-probe"), "/workspace", &env);
+        assert!(
+            cmd.starts_with("cd '/workspace/cwd-probe' && "),
+            "got: {cmd}"
+        );
+
+        // An absolute working_dir still passes through unchanged.
+        let cmd2 = build_command("pwd", &[], Some("/tmp/abs"), "/workspace", &env);
+        assert!(cmd2.starts_with("cd '/tmp/abs' && "), "got: {cmd2}");
     }
 
     #[test]
@@ -258,5 +281,20 @@ mod tests {
             cmd.contains("'BASH_ENV='") && !cmd.contains("malicious-startup"),
             "got: {cmd}"
         );
+    }
+
+    /// `run_streaming` builds its result via
+    /// [`ExecResult::from_shell_status`], not the plain constructor — ACA
+    /// reports a foreign `SIGTERM` only as the shell's `128 + N` exit
+    /// code, so decoding it is what lets `exec_reports_a_foreign_signal`
+    /// (the conformance check) see `signal == Some(15)`. This pins the
+    /// decode this crate now relies on: exercising the live path is the
+    /// conformance suite's job, but the constant is worth freezing here.
+    #[test]
+    fn shell_status_143_decodes_to_sigterm() {
+        let result =
+            ExecResult::from_shell_status(Termination::Exited, Some(143), Duration::from_secs(0));
+        assert_eq!(result.signal, Some(15), "128 + SIGTERM must decode to 15");
+        assert_eq!(result.exit_code, Some(143), "the raw code stays intact");
     }
 }

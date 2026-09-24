@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, Result};
+use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
 
 use crate::client::{AcaApiError, AcaClient, aca_error};
 use crate::exec::shq;
@@ -108,11 +108,15 @@ pub fn file_kind(is_dir: bool, is_symlink: bool) -> FileKind {
 #[async_trait]
 impl Filesystem for AcaFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let path = self.abspath(path);
-        self.client
-            .fs_cat(&self.sandbox_id, &path)
-            .await
-            .map_err(aca_error)
+        let resolved = self.abspath(path);
+        match self.client.fs_cat(&self.sandbox_id, &resolved).await {
+            Ok(bytes) => Ok(bytes),
+            Err(AcaApiError::NotFound) => Err(Error::NotFound {
+                resource: ResourceKind::File,
+                id: path.to_owned(),
+            }),
+            Err(error) => Err(aca_error(error)),
+        }
     }
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
@@ -144,12 +148,17 @@ impl Filesystem for AcaFs {
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        let path = self.abspath(path);
-        let stat = self
-            .client
-            .fs_stat(&self.sandbox_id, &path)
-            .await
-            .map_err(aca_error)?;
+        let resolved = self.abspath(path);
+        let stat = match self.client.fs_stat(&self.sandbox_id, &resolved).await {
+            Ok(stat) => stat,
+            Err(AcaApiError::NotFound) => {
+                return Err(Error::NotFound {
+                    resource: ResourceKind::File,
+                    id: path.to_owned(),
+                });
+            }
+            Err(error) => return Err(aca_error(error)),
+        };
         let mut metadata = FileMetadata::new(file_kind(stat.is_dir, stat.is_symlink), stat.size);
         metadata.mode = Some(stat.mode);
         metadata.modified_at = u64::try_from(stat.modified_time)
