@@ -42,7 +42,7 @@ pub trait TokenSource: Send + Sync {
 /// `DefaultAzureCredential` with `DeveloperToolsCredential`").
 pub struct EntraTokenSource {
     credential: Arc<dyn TokenCredential>,
-    audience:   String,
+    audience: String,
 }
 
 /// Which credential chain [`EntraTokenSource::from_mode`] should build.
