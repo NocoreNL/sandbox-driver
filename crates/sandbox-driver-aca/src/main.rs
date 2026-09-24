@@ -3,8 +3,6 @@
 //! Speaks the JSON-RPC plugin protocol on stdin/stdout and drives Azure
 //! Container Apps sessions over the data-plane REST API. Stdout belongs
 //! to the protocol; logs go to stderr.
-//!
-//! TODO(Task 12): `AcaProvider::connect` is currently `unimplemented!()`.
 
 use std::io::stderr;
 use std::sync::Arc;
