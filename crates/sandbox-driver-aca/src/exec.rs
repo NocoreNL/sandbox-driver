@@ -24,8 +24,8 @@ use crate::client::{AcaApiError, AcaClient};
 /// `env` is the sandbox's `spec.env` captured at create time (so
 /// `GITHUB_TOKEN` and friends reach every exec, including derived git/
 /// search/services calls that build their own [`ExecSpec`] without
-/// re-supplying it); [`ExecSpec::env`] is merged on top per call and wins
-/// on key collision.
+/// re-supplying it); [`ExecSpec::launch_env`] is merged on top per call
+/// (see [`merged_env`]) and wins on key collision.
 pub struct AcaExec {
     pub client: Arc<AcaClient>,
     pub sandbox_id: String,
@@ -56,8 +56,7 @@ impl Exec for AcaExec {
             return Err(Error::unsupported(Capability::ExecStop));
         }
 
-        let mut merged = self.env.clone();
-        merged.extend(spec.env.clone());
+        let merged = merged_env(&self.env, spec);
 
         let cmd = build_command(
             &spec.program,
@@ -100,6 +99,20 @@ impl Exec for AcaExec {
 
     // `spawn_stdio` keeps the trait's default `Error::Unsupported` body:
     // ACA has no long-lived bidirectional stdio process API.
+}
+
+/// The env a call launches with: this exec's captured sandbox env,
+/// overlaid with the spec's *launch* env — [`ExecSpec::launch_env`], not
+/// `spec.env` directly. `launch_env()` re-blanks `BASH_ENV` for the Bash
+/// helper spec (`ExecSpec::bash`) whatever the caller set, so a
+/// caller-supplied `BASH_ENV` can never make the inner `bash -c` source an
+/// arbitrary startup file ahead of the script; every other provider in
+/// this crate (docker, daytona, host) merges through `launch_env()` for
+/// the same reason. The spec's env wins on key collision.
+fn merged_env(base: &BTreeMap<String, String>, spec: &ExecSpec) -> BTreeMap<String, String> {
+    let mut merged = base.clone();
+    merged.extend(spec.launch_env().into_owned());
+    merged
 }
 
 /// Build the single command string ACA's `executeShellCommand` runs.
@@ -178,8 +191,7 @@ mod tests {
         env.insert("GITHUB_TOKEN".to_string(), "s3cr3t-not-real".to_string());
         let cmd = build_command("git", &["status".into()], None, "/workspace", &env);
         assert!(
-            cmd.contains("env 'GITHUB_TOKEN=s3cr3t-not-real'")
-                || cmd.contains("GITHUB_TOKEN=s3cr3t-not-real"),
+            cmd.contains("env 'GITHUB_TOKEN=s3cr3t-not-real'"),
             "got: {cmd}"
         );
     }
@@ -208,5 +220,53 @@ mod tests {
         env.insert("FOO".to_string(), "bar".to_string());
         let cmd = build_command("echo", &["hi".into()], None, "/workspace", &env);
         assert_eq!(cmd, "cd '/workspace' && env 'FOO=bar' 'echo' 'hi'");
+    }
+
+    #[test]
+    fn merged_env_overlays_spec_launch_env_over_base_env() {
+        let mut base = BTreeMap::new();
+        base.insert("GITHUB_TOKEN".to_string(), "base-token".to_string());
+        base.insert("SHARED".to_string(), "base-value".to_string());
+        let spec = ExecSpec::new("git").env_var("SHARED", "spec-value");
+
+        let merged = merged_env(&base, &spec);
+
+        assert_eq!(
+            merged.get("GITHUB_TOKEN").map(String::as_str),
+            Some("base-token"),
+            "base env not carried over"
+        );
+        assert_eq!(
+            merged.get("SHARED").map(String::as_str),
+            Some("spec-value"),
+            "spec env must win on collision"
+        );
+    }
+
+    /// Mirrors the crate's own
+    /// `the_bash_helpers_blank_bash_env_wins_at_launch` (sandbox-driver's
+    /// `exec.rs`): a caller-supplied `BASH_ENV` on a Bash-helper spec must
+    /// not reach the launched command, because `bash -c` sources it before
+    /// running the script — merging through `spec.env` directly (instead
+    /// of `spec.launch_env()`) would let a caller point `BASH_ENV` at an
+    /// arbitrary startup file inside the sandbox.
+    #[test]
+    fn merged_env_blanks_bash_env_for_the_bash_helper_spec() {
+        let base = BTreeMap::new();
+        let spec = ExecSpec::bash("echo hi").env_var("BASH_ENV", "/etc/malicious-startup.sh");
+
+        let merged = merged_env(&base, &spec);
+
+        assert_eq!(
+            merged.get("BASH_ENV").map(String::as_str),
+            Some(""),
+            "BASH_ENV must be re-blanked at launch, not the caller's override"
+        );
+
+        let cmd = build_command(&spec.program, &spec.args, None, "/workspace", &merged);
+        assert!(
+            cmd.contains("'BASH_ENV='") && !cmd.contains("malicious-startup"),
+            "got: {cmd}"
+        );
     }
 }
