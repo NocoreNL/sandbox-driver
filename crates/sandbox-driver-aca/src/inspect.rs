@@ -41,21 +41,25 @@ pub fn map_state(state: &AcaSandboxState) -> SandboxState {
 /// caller-visible labels on a live handle are populated by `describe()`
 /// (Task 11) instead, not here.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `r.id` is not a valid [`SandboxId`] (empty, over 256 bytes, or
-/// containing whitespace/control characters). ACA-issued sandbox ids are
-/// never any of those, so this is treated the same as elsewhere in this
-/// workspace (see e.g. `sandbox-driver-docker`'s `DockerSandbox`
-/// construction): an invariant, not a runtime error path.
-#[must_use]
-pub fn status_from_ref(r: &SandboxResource) -> SandboxStatus {
-    let id = SandboxId::try_new(r.id.clone()).expect("ACA sandbox id is a valid sandbox id");
+/// Returns `Err` if `r.id` is not a valid [`SandboxId`] (empty, over 256
+/// bytes, or containing whitespace/control characters). This function feeds
+/// `list()`/`attach()`/`describe()` (Tasks 11/12), which each fan out over
+/// many sandboxes at once — one malformed id must not crash status
+/// visibility for every sandbox the process manages, so the error is
+/// propagated to the caller rather than panicking. (Contrast
+/// `sandbox-driver-docker`'s `DockerSandbox` construction, which `.expect`s
+/// on `SandboxId::try_new` — but only in its `create()` path, over an id it
+/// just minted itself and therefore trusts; that's not the analog here.)
+pub fn status_from_ref(r: &SandboxResource) -> Result<SandboxStatus, sandbox_driver::Error> {
+    let id = SandboxId::try_new(&r.id)
+        .map_err(|e| sandbox_driver::Error::invalid_spec("id", e.to_string()))?;
     let mut status = SandboxStatus::new(id, map_state(&r.state));
     status.provider_state = format!("{:?}", r.state);
     status.region.clone_from(&r.region);
     status.created_at = parse_created_at(&r.created_at);
-    status
+    Ok(status)
 }
 
 /// Parse an ACA `createdAt` RFC 3339 timestamp into a [`SystemTime`].
@@ -128,7 +132,7 @@ mod tests {
 
     #[test]
     fn status_from_ref_builds_expected_status() {
-        let status = status_from_ref(&sandbox_resource());
+        let status = status_from_ref(&sandbox_resource()).expect("valid id");
         assert_eq!(status.id.as_str(), "sb-123");
         assert_eq!(status.state, SandboxState::Running);
         assert_eq!(status.provider_state, "Running");
@@ -141,7 +145,14 @@ mod tests {
     fn status_from_ref_tolerates_unparseable_created_at() {
         let mut resource = sandbox_resource();
         resource.created_at = "not-a-timestamp".to_string();
-        let status = status_from_ref(&resource);
+        let status = status_from_ref(&resource).expect("valid id");
         assert_eq!(status.created_at, None);
+    }
+
+    #[test]
+    fn status_from_ref_rejects_malformed_id() {
+        let mut resource = sandbox_resource();
+        resource.id = String::new();
+        assert!(status_from_ref(&resource).is_err());
     }
 }
