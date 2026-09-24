@@ -126,8 +126,9 @@ impl Sandbox for AcaSandbox {
     }
 
     async fn delete(&self) -> Result<()> {
-        // The client already treats a vanished sandbox as success, so
-        // deleting an unknown id is idempotent as the trait requires.
+        // `delete_sandbox` treats a 404 (already gone, or never existed)
+        // as success, so deleting an unknown id is idempotent as the
+        // trait requires.
         self.client
             .delete_sandbox(self.id.as_str())
             .await

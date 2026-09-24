@@ -456,10 +456,16 @@ impl AcaClient {
 
     /// `DELETE .../sandboxes/{id}`. Deletion is asynchronous server-side, so
     /// a successful call here only confirms the delete was accepted, not
-    /// that the sandbox is gone yet.
+    /// that the sandbox is gone yet. Idempotent: a `404` (already gone, or
+    /// never existed) is treated as success, mirroring [`Self::get_sandbox`]'s
+    /// `Ok(None)` early return — `Sandbox::delete`'s contract requires
+    /// deleting an unknown id to succeed.
     pub async fn delete_sandbox(&self, id: &str) -> Result<(), AcaApiError> {
         let url = self.scope.item_url(id);
         let response = self.send::<()>(Method::DELETE, &url, &[], None).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         Self::ok_body(response, "delete sandbox").await?;
         Ok(())
     }
