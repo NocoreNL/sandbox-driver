@@ -11,7 +11,7 @@ fi
 
 target=$1
 version=$2
-plugins=(sandbox-driver-host sandbox-driver-docker sandbox-driver-daytona)
+plugins=(sandbox-driver-host sandbox-driver-docker sandbox-driver-daytona sandbox-driver-aca)
 
 case "$target" in
   aarch64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
@@ -44,7 +44,8 @@ fi
 cargo build --locked --release --target "$target" \
   --package sandbox-driver-host \
   --package sandbox-driver-docker \
-  --package sandbox-driver-daytona
+  --package sandbox-driver-daytona \
+  --package sandbox-driver-aca
 
 output_dir=dist-release
 staging_dir=$(mktemp -d)
