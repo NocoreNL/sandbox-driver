@@ -18,17 +18,23 @@ use sandbox_driver::{Capabilities, Isolation};
 /// Starts from [`Capabilities::minimal`] and enables only what
 /// [`provider::AcaProvider`]/[`sandbox::AcaSandbox`] actually implement:
 /// stdout/stderr arrive as genuinely separate streams
-/// (`exec.streams_separated`), the filesystem facet is native rather than
-/// exec-derived (`fs.native`), and network egress is a domain allow-list
-/// (`network.domain_allow_list`). Everything else — stdin, stop, live
-/// streaming, upload/download, search/git/services (v1 has no native
-/// implementation and no exec-derived fallback wired in), pty, snapshots,
-/// volumes, access — stays at the minimal default. Conformance checks
-/// enforce this both ways: a capability claimed here but not implemented
-/// fails conformance, and vice versa.
+/// (`exec.streams_separated`), a stop token cancels a streaming exec
+/// (`exec.stop` — best-effort: see `crate::exec::AcaExec::exec_once`'s doc
+/// comment), the filesystem facet is native rather than exec-derived
+/// (`fs.native`), and network egress is a domain allow-list
+/// (`network.domain_allow_list`). `exec.stop` is not optional: the plugin
+/// WIRE (`sandbox-driver-protocol`) sets `term`/`kill` on every streaming
+/// exec unconditionally, so a provider declaring `exec.stop = false` would
+/// reject every streaming exec that reaches it over the wire. Everything
+/// else — stdin, live streaming, upload/download, search/git/services (v1
+/// has no native implementation and no exec-derived fallback wired in),
+/// pty, snapshots, volumes, access — stays at the minimal default.
+/// Conformance checks enforce this both ways: a capability claimed here but
+/// not implemented fails conformance, and vice versa.
 pub fn aca_capabilities() -> Capabilities {
     let mut caps = Capabilities::minimal(Isolation::Container);
     caps.exec.streams_separated = true;
+    caps.exec.stop = true;
     caps.fs.native = true;
     caps.network.domain_allow_list = true;
     caps
@@ -43,6 +49,7 @@ mod tests {
         let caps = aca_capabilities();
 
         assert!(caps.exec.streams_separated);
+        assert!(caps.exec.stop);
         assert!(caps.fs.native);
         assert!(caps.network.domain_allow_list);
 
@@ -63,6 +70,7 @@ mod tests {
         // since `Capabilities` has no `PartialEq`.
         let mut expected = Capabilities::minimal(Isolation::Container);
         expected.exec.streams_separated = true;
+        expected.exec.stop = true;
         expected.fs.native = true;
         expected.network.domain_allow_list = true;
         assert_eq!(

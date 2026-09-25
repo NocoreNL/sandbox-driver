@@ -1,21 +1,36 @@
 //! Exec support for ACA sandboxes; git/search/services derive from this.
 //!
 //! ACA's `executeShellCommand` is one buffered, blocking REST call: no
-//! stdin channel, no cancellation, no live streaming. [`AcaExec::run`] and
+//! stdin channel, no live streaming. [`AcaExec::run`] and
 //! [`AcaExec::run_streaming`] both resolve to that single call — a caller
-//! asking for stdin or a stop token gets [`Error::Unsupported`], and a
-//! streaming caller gets its output replayed through the sink after the
-//! call returns, honestly reporting `live_streaming: false`.
+//! asking for stdin gets [`Error::Unsupported`], and a streaming caller
+//! gets its output replayed through the sink after the call returns,
+//! honestly reporting `live_streaming: false`.
+//!
+//! Cancellation (`exec.stop`) is real, but best-effort on the server side:
+//! [`AcaExec::exec_once`] races the ACA HTTP call against the caller's
+//! `term`/`kill` tokens and the spec's timeout, and returns as soon as one
+//! fires — but ACA has no API to abort a command already in flight, so a
+//! cancelled command keeps running server-side (an orphan) until it exits
+//! on its own or the sandbox auto-suspends. This is the plugin WIRE's own
+//! requirement, not a choice: `sandbox-driver-protocol`'s streaming exec
+//! path always sets `term`/`kill` on every call
+//! (`sandbox-driver-protocol/src/server/exec.rs`), so a provider that
+//! rejects their mere presence (as this crate used to) rejects every
+//! streaming exec fabro sends.
 
 use std::collections::BTreeMap;
+use std::future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputStream,
-    Result, Termination,
+    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
+    OutputCaptureBuffer, OutputStream, Result, Termination, run_with_stop_grace,
 };
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::{AcaClient, aca_error};
 use crate::fs::abspath;
@@ -53,10 +68,34 @@ impl Exec for AcaExec {
         if controls.stdin.is_some() {
             return Err(Error::unsupported(Capability::ExecStdinStream));
         }
-        if controls.term.is_some() || controls.kill.is_some() {
-            return Err(Error::unsupported(Capability::ExecStop));
-        }
 
+        run_with_stop_grace(spec, controls, |spec, controls| async move {
+            self.exec_once(&spec, controls).await
+        })
+        .await
+    }
+
+    // `spawn_stdio` keeps the trait's default `Error::Unsupported` body:
+    // ACA has no long-lived bidirectional stdio process API.
+}
+
+impl AcaExec {
+    /// Runs one ACA exec call, racing it against the caller's `term`/`kill`
+    /// tokens and the spec's own timeout (when [`run_with_stop_grace`]
+    /// didn't already take the timeout over for its ladder).
+    ///
+    /// ACA cannot abort a command already in flight — whichever branch
+    /// fires first decides the reported [`Termination`], but a cancelled
+    /// command keeps running server-side until it exits on its own or the
+    /// sandbox auto-suspends. `signal` stays `None` on every non-`Exited`
+    /// branch: this crate has no way to observe what, if anything,
+    /// actually stopped the remote process, and the conformance suite's
+    /// stop checks skip the signal assertion when it's absent.
+    async fn exec_once(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
         let merged = merged_env(&self.env, spec);
 
         let cmd = build_command(
@@ -67,39 +106,97 @@ impl Exec for AcaExec {
             &merged,
         );
 
-        let resp = self
-            .client
-            .exec(&self.sandbox_id, &cmd)
-            .await
-            .map_err(aca_error)?;
+        let started = Instant::now();
+        let call = self.client.exec(&self.sandbox_id, &cmd);
+        let term = cancelled(controls.term.as_ref());
+        let kill = cancelled(controls.kill.as_ref());
+        let timeout = sleep_or_never(spec.timeout);
 
-        let mut result = ExecResult::from_shell_status(
-            Termination::Exited,
-            Some(resp.exit_code),
-            Duration::from_millis(resp.execution_time_ms),
-        );
-        result.stdout = resp.stdout.into_bytes();
-        result.stderr = resp.stderr.into_bytes();
+        tokio::select! {
+            res = call => {
+                let resp = res.map_err(aca_error)?;
 
-        // ACA delivers output only after the call returns — there is
-        // nothing to stream live. A caller with a sink still gets every
-        // byte, replayed in order, before the buffered result comes back.
-        if let Some(sink) = &controls.sink {
-            if !result.stdout.is_empty() {
-                sink(OutputStream::Stdout, result.stdout.clone()).await?;
+                // ACA hands back the whole buffer at once (no chunked
+                // delivery), so sanitization runs over the complete buffer
+                // in one pass — [`OutputSanitization::sanitize`], not the
+                // chunk-at-a-time `OutputSanitizer` a live-streaming
+                // provider needs. The sink and the retention cap both see
+                // the *sanitized* bytes, matching every other provider in
+                // this workspace (docker's `StreamOutput::drain` pushes a
+                // chunk through the sanitizer before the sink or the
+                // capture buffer ever see it).
+                let stdout = spec.output_sanitization.sanitize(&resp.stdout.into_bytes());
+                let stderr = spec.output_sanitization.sanitize(&resp.stderr.into_bytes());
+
+                // ACA delivers output only after the call returns — there
+                // is nothing to stream live. A caller with a sink still
+                // gets every sanitized byte, replayed in order, before the
+                // buffered (and possibly retention-capped) result comes
+                // back.
+                if let Some(sink) = &controls.sink {
+                    if !stdout.is_empty() {
+                        sink(OutputStream::Stdout, stdout.clone()).await?;
+                    }
+                    if !stderr.is_empty() {
+                        sink(OutputStream::Stderr, stderr.clone()).await?;
+                    }
+                }
+
+                let mut stdout_buffer = OutputCaptureBuffer::new(controls.retained_output_limit);
+                stdout_buffer.push(&stdout);
+                let (stdout, stdout_capture) = stdout_buffer.into_parts();
+
+                let mut stderr_buffer = OutputCaptureBuffer::new(controls.retained_output_limit);
+                stderr_buffer.push(&stderr);
+                let (stderr, stderr_capture) = stderr_buffer.into_parts();
+
+                let mut result = ExecResult::from_shell_status(
+                    Termination::Exited,
+                    Some(resp.exit_code),
+                    Duration::from_millis(resp.execution_time_ms),
+                );
+                result.stdout = stdout;
+                result.stderr = stderr;
+
+                let mut streaming = ExecStreamingResult::new(result);
+                streaming.streams_separated = true;
+                streaming.stdout_capture = stdout_capture;
+                streaming.stderr_capture = stderr_capture;
+                Ok(streaming)
             }
-            if !result.stderr.is_empty() {
-                sink(OutputStream::Stderr, result.stderr.clone()).await?;
-            }
+            () = term => Ok(cancelled_result(Termination::Cancelled, started.elapsed())),
+            () = kill => Ok(cancelled_result(Termination::Killed, started.elapsed())),
+            () = timeout => Ok(cancelled_result(Termination::TimedOut, started.elapsed())),
         }
-
-        let mut streaming = ExecStreamingResult::new(result);
-        streaming.streams_separated = true;
-        Ok(streaming)
     }
+}
 
-    // `spawn_stdio` keeps the trait's default `Error::Unsupported` body:
-    // ACA has no long-lived bidirectional stdio process API.
+/// Waits for `token` to cancel, or never resolves when there isn't one —
+/// so it can sit as an always-present branch in a `tokio::select!`.
+async fn cancelled(token: Option<&CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => future::pending().await,
+    }
+}
+
+/// Waits for `timeout` to elapse, or never resolves when there isn't
+/// one — mirrors [`cancelled`] for the spec's own deadline.
+async fn sleep_or_never(timeout: Option<Duration>) {
+    match timeout {
+        Some(timeout) => sleep(timeout).await,
+        None => future::pending().await,
+    }
+}
+
+/// Builds the (empty-output) result for a call this crate ended early —
+/// `term`/`kill`/`timeout` fired before the ACA call returned. `signal`
+/// stays `None`: see [`AcaExec::exec_once`]'s doc comment.
+fn cancelled_result(termination: Termination, elapsed: Duration) -> ExecStreamingResult {
+    let result = ExecResult::new(termination, None, elapsed);
+    let mut streaming = ExecStreamingResult::new(result);
+    streaming.streams_separated = true;
+    streaming
 }
 
 /// The env a call launches with: this exec's captured sandbox env,
@@ -122,12 +219,17 @@ fn merged_env(base: &BTreeMap<String, String>, spec: &ExecSpec) -> BTreeMap<Stri
 /// [`crate::fs::abspath`] — a relative `working_dir` is joined onto
 /// `workspace` instead of being handed to `cd` as-is, since ACA's shell
 /// would otherwise resolve it against its own ambient cwd rather than the
-/// sandbox's workspace), or `workspace` itself when unset. `env`
-/// assignments (sorted — `env` is a `BTreeMap`) are prepended via
-/// `env K=V...` so they reach the program without a shell `export`. Every
-/// token is single-quoted with [`shq`], preserving `execvp` semantics
-/// (`program`/`args` reach the process unchanged, no glob or word
-/// splitting) even though ACA's transport is a single shell string.
+/// sandbox's workspace), or `workspace` itself when unset. `cwd` is created
+/// with `mkdir -p` before the `cd` — the ACA disk image's ubuntu root has
+/// no `/workspace` (or any other cwd this plugin picks) preprovisioned, so
+/// every exec would otherwise fail with `cd: can't cd to <dir>` before the
+/// caller's command ever ran; `mkdir -p` is idempotent, so this is a no-op
+/// once the directory exists. `env` assignments (sorted — `env` is a
+/// `BTreeMap`) are prepended via `env K=V...` so they reach the program
+/// without a shell `export`. Every token is single-quoted with [`shq`],
+/// preserving `execvp` semantics (`program`/`args` reach the process
+/// unchanged, no glob or word splitting) even though ACA's transport is a
+/// single shell string.
 fn build_command(
     program: &str,
     args: &[String],
@@ -137,6 +239,10 @@ fn build_command(
 ) -> String {
     let cwd = working_dir.map_or_else(|| workspace.to_owned(), |dir| abspath(workspace, dir));
     let mut parts = vec![
+        "mkdir".to_string(),
+        "-p".to_string(),
+        shq(&cwd),
+        "&&".to_string(),
         "cd".to_string(),
         shq(&cwd),
         "&&".to_string(),
@@ -173,11 +279,17 @@ mod tests {
             "/workspace",
             &env,
         );
-        assert!(cmd.starts_with("cd '/workspace' && "), "got: {cmd}");
+        assert!(
+            cmd.starts_with("mkdir -p '/workspace' && cd '/workspace' && "),
+            "got: {cmd}"
+        );
         assert!(cmd.contains("git"));
 
         let cmd2 = build_command("ls", &[], Some("/tmp"), "/workspace", &env);
-        assert!(cmd2.starts_with("cd '/tmp' && "), "got: {cmd2}");
+        assert!(
+            cmd2.starts_with("mkdir -p '/tmp' && cd '/tmp' && "),
+            "got: {cmd2}"
+        );
     }
 
     /// A relative `working_dir` must resolve against `workspace`, not
@@ -189,13 +301,16 @@ mod tests {
         let env = BTreeMap::new();
         let cmd = build_command("pwd", &[], Some("cwd-probe"), "/workspace", &env);
         assert!(
-            cmd.starts_with("cd '/workspace/cwd-probe' && "),
+            cmd.starts_with("mkdir -p '/workspace/cwd-probe' && cd '/workspace/cwd-probe' && "),
             "got: {cmd}"
         );
 
         // An absolute working_dir still passes through unchanged.
         let cmd2 = build_command("pwd", &[], Some("/tmp/abs"), "/workspace", &env);
-        assert!(cmd2.starts_with("cd '/tmp/abs' && "), "got: {cmd2}");
+        assert!(
+            cmd2.starts_with("mkdir -p '/tmp/abs' && cd '/tmp/abs' && "),
+            "got: {cmd2}"
+        );
     }
 
     #[test]
@@ -232,7 +347,10 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("FOO".to_string(), "bar".to_string());
         let cmd = build_command("echo", &["hi".into()], None, "/workspace", &env);
-        assert_eq!(cmd, "cd '/workspace' && env 'FOO=bar' 'echo' 'hi'");
+        assert_eq!(
+            cmd,
+            "mkdir -p '/workspace' && cd '/workspace' && env 'FOO=bar' 'echo' 'hi'"
+        );
     }
 
     #[test]

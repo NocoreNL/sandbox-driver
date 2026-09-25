@@ -379,6 +379,38 @@ fn extract_problem_message(body: &str) -> Option<String> {
     }
 }
 
+/// Whether `body` is ACA's `400` shape for an unknown/malformed sandbox id
+/// on a single-id `GET`/`DELETE` — captured live as, e.g.:
+/// `{"title":"One or more validation errors occurred.","status":400,"errors":{"id":["The input was not valid."]},...}`.
+///
+/// ACA validates the `{id}` path segment (it expects a GUID) *before*
+/// looking the sandbox up, so an id that doesn't parse — like this crate's
+/// own generated ids, or a caller-supplied id such as
+/// `"conformance-does-not-exist"` — is rejected with this `400` rather than
+/// the `404 SandboxNotFound` a well-formed-but-absent GUID gets (verified
+/// live: a random all-zero GUID id correctly 404s). Both cases mean the
+/// same thing to a caller — "no sandbox by that id exists" — so
+/// [`AcaClient::get_sandbox`]/[`AcaClient::delete_sandbox`] treat them
+/// alike.
+///
+/// Scoped to the `errors.id` key specifically (ASP.NET Core's
+/// `ValidationProblemDetails` shape, one entry per invalid field) so this
+/// never masks a different validation failure. This is safe to check
+/// unconditionally on a `400` from `get_sandbox`/`delete_sandbox` — both
+/// send no body, so `id` is the only field ACA could be validating — but
+/// deliberately not reused by `create_sandbox`, whose `400` can legitimately
+/// name other fields (`resources`, `sourcesRef`, ...) that must still
+/// surface as errors.
+fn is_unknown_id_validation_error(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .get("errors")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|errors| errors.contains_key("id"))
+}
+
 /// Map an [`AcaApiError`] to the crate's [`Error`]. `Auth` becomes
 /// [`Error::Auth`] (a caller-preflightable class); everything else folds
 /// into [`Error::Provider`], keeping the classified `AcaApiError` as the
@@ -435,14 +467,22 @@ impl AcaClient {
     }
 
     /// `GET .../sandboxes/{id}` — returns `Ok(None)` on the captured
-    /// `404 SandboxNotFound`.
+    /// `404 SandboxNotFound`, and also on a `400` that
+    /// [`is_unknown_id_validation_error`] identifies as ACA rejecting a
+    /// malformed/unrecognized id before it ever looks the sandbox up (see
+    /// that function's doc comment).
     pub async fn get_sandbox(&self, id: &str) -> Result<Option<SandboxResource>, AcaApiError> {
         let url = self.scope.item_url(id);
         let response = self.send::<()>(Method::GET, &url, &[], None).await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let (status, body) = Self::read_text(response, "get sandbox").await?;
+        if status == StatusCode::NOT_FOUND
+            || (status == StatusCode::BAD_REQUEST && is_unknown_id_validation_error(&body))
+        {
             return Ok(None);
         }
-        let body = Self::ok_body(response, "get sandbox").await?;
+        if !status.is_success() {
+            return Err(map_status(status, &body));
+        }
         Self::decode(&body, "get sandbox").map(Some)
     }
 
@@ -459,14 +499,21 @@ impl AcaClient {
     /// that the sandbox is gone yet. Idempotent: a `404` (already gone, or
     /// never existed) is treated as success, mirroring [`Self::get_sandbox`]'s
     /// `Ok(None)` early return — `Sandbox::delete`'s contract requires
-    /// deleting an unknown id to succeed.
+    /// deleting an unknown id to succeed. A `400` that
+    /// [`is_unknown_id_validation_error`] identifies as an unrecognized id
+    /// is treated the same way, for the same reason as `get_sandbox`.
     pub async fn delete_sandbox(&self, id: &str) -> Result<(), AcaApiError> {
         let url = self.scope.item_url(id);
         let response = self.send::<()>(Method::DELETE, &url, &[], None).await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        let (status, body) = Self::read_text(response, "delete sandbox").await?;
+        if status == StatusCode::NOT_FOUND
+            || (status == StatusCode::BAD_REQUEST && is_unknown_id_validation_error(&body))
+        {
             return Ok(());
         }
-        Self::ok_body(response, "delete sandbox").await?;
+        if !status.is_success() {
+            return Err(map_status(status, &body));
+        }
         Ok(())
     }
 
@@ -657,14 +704,27 @@ impl AcaClient {
         })
     }
 
-    /// Read the response body, mapping a non-success status to a classified
-    /// [`AcaApiError`].
-    async fn ok_body(response: reqwest::Response, op: &'static str) -> Result<String, AcaApiError> {
+    /// Reads the response's status and body text, without judging success —
+    /// callers that need to inspect the body before deciding how to map a
+    /// non-2xx status (`get_sandbox`/`delete_sandbox`, against
+    /// [`is_unknown_id_validation_error`]) use this directly;
+    /// [`Self::ok_body`] is the simpler wrapper for every other endpoint.
+    async fn read_text(
+        response: reqwest::Response,
+        op: &'static str,
+    ) -> Result<(StatusCode, String), AcaApiError> {
         let status = response.status();
         let body = response.text().await.map_err(|err| AcaApiError::Other {
             status: status.as_u16(),
             message: format!("failed to read ACA {op} response body: {err}"),
         })?;
+        Ok((status, body))
+    }
+
+    /// Read the response body, mapping a non-success status to a classified
+    /// [`AcaApiError`].
+    async fn ok_body(response: reqwest::Response, op: &'static str) -> Result<String, AcaApiError> {
+        let (status, body) = Self::read_text(response, op).await?;
         if status.is_success() {
             Ok(body)
         } else {
@@ -755,5 +815,29 @@ mod tests {
                 "api.anthropic.com:Allow".to_string(),
             ]
         );
+    }
+
+    /// Captured live: `DELETE`/`GET .../sandboxes/conformance-does-not-exist`
+    /// (a non-GUID id) both return this body with a `400`.
+    #[test]
+    fn is_unknown_id_validation_error_matches_the_live_400_body() {
+        let body = r#"{"type":"https://tools.ietf.org/html/rfc9110#section-15.5.1","title":"One or more validation errors occurred.","status":400,"errors":{"id":["The input was not valid."]},"traceId":"00-bdc24794b51bd3a7603ed990fad984df-aa42f3f22b6fc71c-01","requestId":"5dbbe4d2-94c8-4591-b30b-6505e70f5d4a"}"#;
+        assert!(is_unknown_id_validation_error(body));
+    }
+
+    #[test]
+    fn is_unknown_id_validation_error_rejects_other_shapes() {
+        // A 404 body never reaches this function in practice, but it must
+        // not match even if it did.
+        assert!(!is_unknown_id_validation_error(
+            r#"{"title":"SandboxNotFound","status":404,"detail":"Requested document not found."}"#
+        ));
+        // A validation error on a different field (e.g. a malformed
+        // `create` body) must not be treated as an unknown id.
+        assert!(!is_unknown_id_validation_error(
+            r#"{"title":"One or more validation errors occurred.","status":400,"errors":{"resources":["required"]}}"#
+        ));
+        assert!(!is_unknown_id_validation_error("not json"));
+        assert!(!is_unknown_id_validation_error("{}"));
     }
 }

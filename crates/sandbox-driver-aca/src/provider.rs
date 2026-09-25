@@ -204,8 +204,16 @@ impl AcaProvider {
     /// [`Self::create`] wraps this one call in best-effort cleanup that
     /// covers every failure mode uniformly, mirroring
     /// `sandbox-driver-daytona`'s `create_inner`/`cleanup_failed_create`
-    /// split.
-    async fn finish_create(&self, id: &str, plan: AcaAppPlan) -> Result<Arc<dyn Sandbox>> {
+    /// split. `name` and `events` have no home on [`AcaAppPlan`] (the ACA
+    /// create body has no name field, and the plan is built before an
+    /// `EventEmitter` exists) so they're threaded through directly.
+    async fn finish_create(
+        &self,
+        id: &str,
+        plan: AcaAppPlan,
+        name: Option<String>,
+        events: EventEmitter,
+    ) -> Result<Arc<dyn Sandbox>> {
         self.wait_for_running(id).await?;
 
         self.client
@@ -217,11 +225,13 @@ impl AcaProvider {
             SandboxId::try_new(id).map_err(|error| Error::invalid_spec("id", error.to_string()))?;
         let sandbox = AcaSandbox::new(
             sandbox_id,
+            name,
             plan.working_dir,
             self.caps.clone(),
             self.client.clone(),
             plan.labels,
             plan.env,
+            events,
         );
         Ok(Arc::new(sandbox))
     }
@@ -243,6 +253,8 @@ impl SandboxProvider for AcaProvider {
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_events = emitter.clone();
+        let name = spec.name.clone();
         emitter
             .run(
                 EventSubject::pending_sandbox(spec.name.clone()),
@@ -274,7 +286,7 @@ impl SandboxProvider for AcaProvider {
                     // already-Running sandbox — must best-effort delete it
                     // before propagating the original error, or the
                     // sandbox leaks forever.
-                    match self.finish_create(&id, plan).await {
+                    match self.finish_create(&id, plan, name, handle_events).await {
                         Ok(sandbox) => Ok(sandbox),
                         Err(error) => {
                             let _ = self.client.delete_sandbox(&id).await;
@@ -292,6 +304,7 @@ impl SandboxProvider for AcaProvider {
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_events = emitter.clone();
         emitter
             .run(
                 EventSubject::sandbox(Some(id.clone())),
@@ -311,16 +324,18 @@ impl SandboxProvider for AcaProvider {
                     // ACA reports no labels of its own (see
                     // `SandboxResource`'s doc comment) and `attach` has no
                     // `SandboxSpec` to read a caller-requested working
-                    // directory or env from, so both start empty/default
-                    // here — a documented limitation of attaching without
-                    // the original create-time spec.
+                    // directory, env, or name from, so all three start
+                    // empty/default here — a documented limitation of
+                    // attaching without the original create-time spec.
                     let sandbox = AcaSandbox::new(
                         id.clone(),
+                        None,
                         ATTACH_WORKING_DIRECTORY.to_owned(),
                         self.caps.clone(),
                         self.client.clone(),
                         BTreeMap::new(),
                         BTreeMap::new(),
+                        handle_events,
                     );
                     Ok(Arc::new(sandbox) as Arc<dyn Sandbox>)
                 },
